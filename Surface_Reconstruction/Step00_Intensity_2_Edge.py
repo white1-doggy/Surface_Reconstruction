@@ -13,6 +13,7 @@ TODO: Code for converting T1w image to edge maps of brain tissue
 @Contact: JiamengLiu.PRC@gmail.com
 """
 import os
+import argparse
 import ants
 import numpy as np
 import SimpleITK as sitk
@@ -77,25 +78,67 @@ def error_back(err):
     print(err)
 
 
+def _gather_subjects(source, required_files):
+    subjects = []
+    missing_inputs = []
+    for name in sorted(os.listdir(source)):
+        subj_dir = os.path.join(source, name)
+        if not os.path.isdir(subj_dir):
+            continue
+        expected = [os.path.join(subj_dir, f) for f in required_files]
+        if all(os.path.exists(path) for path in expected):
+            subjects.append(name)
+        else:
+            missing_inputs.append((name, [f for f, path in zip(required_files, expected) if not os.path.exists(path)]))
+
+    if missing_inputs:
+        print('Skipping subjects without required inputs:')
+        for name, missing in missing_inputs:
+            print(f'  - {name}: missing {", ".join(missing)}')
+
+    return subjects
+
+
 if __name__ == '__main__':
     from multiprocessing import Pool
     from tqdm import tqdm
 
-    source = r'/home_data/home/lianzf2024/test'
-    target = r'/home_data/home/lianzf2024/test'
+    parser = argparse.ArgumentParser(description='Generate Sobel edge maps for brain volumes')
+    parser.add_argument('--source_folder', type=str,
+                        default='/public_bme2/bme-wangqian2/wangxy/T1Img',
+                        help='Directory containing subject folders with Step01 outputs')
+    parser.add_argument('--target_folder', type=str, default=None,
+                        help='Directory where edge maps will be written. Defaults to source folder')
+    parser.add_argument('--input_filename', type=str, default='brain.nii.gz',
+                        help='Filename of the brain intensity image produced by Step01')
+    parser.add_argument('--output_filename', type=str, default='brain_sober.nii.gz',
+                        help='Filename used when writing the Sobel edge map')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of parallel worker processes to launch')
 
-    file_list = os.listdir(source)
-    file_list.sort()
+    args = parser.parse_args()
 
-    pool_num = 8
-    pool = Pool(pool_num)
-    pbar = tqdm(total=len(file_list))
-    pbar.set_description('Persudo Brain Extraction')
-    call_fun = lambda *args: update(pbar, *args)
+    source = args.source_folder
+    target = args.target_folder if args.target_folder is not None else args.source_folder
 
-    for item in file_list:
-        source_img_path = os.path.join(source, str(item), 'brain.nii.gz')
-        target_img_path = os.path.join(target, str(item), 'brain_sober.nii.gz')
+    os.makedirs(target, exist_ok=True)
+
+    subjects = _gather_subjects(source, [args.input_filename])
+
+    if len(subjects) == 0:
+        print('No subjects with required inputs found. Nothing to process.')
+        exit(0)
+
+    pool = Pool(processes=args.num_workers)
+    pbar = tqdm(total=len(subjects))
+    pbar.set_description('Edge enhancement (Sobel)')
+    call_fun = lambda *call_args: update(pbar, *call_args)
+
+    for item in subjects:
+        source_img_path = os.path.join(source, item, args.input_filename)
+        target_folder = os.path.join(target, item)
+        os.makedirs(target_folder, exist_ok=True)
+        target_img_path = os.path.join(target_folder, args.output_filename)
 
         kwargs = {
             'source_img_path': source_img_path,
