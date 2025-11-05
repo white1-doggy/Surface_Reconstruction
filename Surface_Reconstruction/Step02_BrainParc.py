@@ -1271,18 +1271,27 @@ def _SoberEdge(source_img_path, target_img_path):
     sitk.WriteImage(sobel_sitk, target_img_path)
 
 
+def _strip_nii_suffix(filename: str) -> str:
+    if filename.endswith('.nii.gz'):
+        return filename[:-7]
+    if filename.endswith('.nii'):
+        return filename[:-4]
+    return os.path.splitext(filename)[0]
+
+
 def get_pred(args, model, source, target, item):
     target_folder = os.path.join(target, item)
-    if not os.path.exists(target_folder):
-        os.mkdir(target_folder)
+    os.makedirs(target_folder, exist_ok=True)
 
-    img_path = os.path.join(source, item, 'brain.nii.gz')
-    img_tmp_path = os.path.join(source, item, 'brain_tmp.nii.gz')
-    img_tmp_RPI_path = os.path.join(source, item, 'brain_tmp_RPI.nii.gz')
+    source_folder = os.path.join(source, item)
 
-    edge_path = os.path.join(source, item, 'brain_sober.nii.gz')
-    edge_tmp_path = os.path.join(source, item, 'brain_sober_tmp.nii.gz')
-    edge_tmp_RPI_path = os.path.join(source, item, 'brain_sober_tmp_RPI.nii.gz')
+    img_path = os.path.join(source_folder, args.intensity_filename)
+    img_tmp_path = os.path.join(target_folder, f"{_strip_nii_suffix(args.intensity_filename)}_tmp.nii.gz")
+    img_tmp_RPI_path = os.path.join(target_folder, f"{_strip_nii_suffix(args.intensity_filename)}_tmp_RPI.nii.gz")
+
+    edge_path = os.path.join(source_folder, args.edge_filename)
+    edge_tmp_path = os.path.join(target_folder, f"{_strip_nii_suffix(args.edge_filename)}_tmp.nii.gz")
+    edge_tmp_RPI_path = os.path.join(target_folder, f"{_strip_nii_suffix(args.edge_filename)}_tmp_RPI.nii.gz")
 
     image_original = ants.image_read(img_path)
     edge_origingal = ants.image_read(edge_path)
@@ -1318,8 +1327,10 @@ def get_pred(args, model, source, target, item):
                                               antialias=False)
         pred_parc = pred_parc.squeeze(0)
 
-        os.system('rm {}'.format(img_tmp_path))
-        os.system('rm {}'.format(edge_tmp_path))
+        if os.path.exists(img_tmp_path):
+            os.remove(img_tmp_path)
+        if os.path.exists(edge_tmp_path):
+            os.remove(edge_tmp_path)
 
     else:
         pred_tissue, pred_parc = _inference(args, model, img_tmp_RPI_path, edge_tmp_RPI_path)
@@ -1335,8 +1346,10 @@ def get_pred(args, model, source, target, item):
     if args.norm_orientation == 1:
         ants_img_pred_tissue = ants.reorient_image2(ants_img_pred_tissue, image_original.orientation)
         ants_img_pred_parc = ants.reorient_image2(ants_img_pred_parc, image_original.orientation)
-        os.system('rm {}'.format(img_tmp_RPI_path))
-        os.system('rm {}'.format(edge_tmp_RPI_path))
+        if os.path.exists(img_tmp_RPI_path):
+            os.remove(img_tmp_RPI_path)
+        if os.path.exists(edge_tmp_RPI_path):
+            os.remove(edge_tmp_RPI_path)
 
     return ants_img_pred_tissue, ants_img_pred_parc
 
@@ -1357,57 +1370,87 @@ def error_back(err):
     print(err)
 
 
+def _gather_subjects(source, required_files):
+    subjects = []
+    missing_inputs = []
+    for name in sorted(os.listdir(source)):
+        subj_dir = os.path.join(source, name)
+        if not os.path.isdir(subj_dir):
+            continue
+        expected = [os.path.join(subj_dir, f) for f in required_files]
+        if all(os.path.exists(path) for path in expected):
+            subjects.append(name)
+        else:
+            missing_inputs.append((name, [f for f, path in zip(required_files, expected) if not os.path.exists(path)]))
+
+    if missing_inputs:
+        print('Skipping subjects without required inputs:')
+        for name, missing in missing_inputs:
+            print(f'  - {name}: missing {", ".join(missing)}')
+
+    return subjects
+
+
 if __name__ == '__main__':
     import multiprocessing
     from multiprocessing import Pool
     from tqdm import tqdm
 
-    multiprocessing.set_start_method('spawn')
-    parser = argparse.ArgumentParser(description='Infant segmentation Experiment settings')
+    multiprocessing.set_start_method('spawn', force=True)
+    parser = argparse.ArgumentParser(description='Brain parcellation and tissue segmentation inference')
     parser.add_argument('--num_classes', type=int, default=106, help='number of output channels')
     parser.add_argument('--num_modalities', type=int, default=2, help='number of input channels')
-    parser.add_argument('--norm_orientation', type=int, default=1, help='number of input channels')
-    parser.add_argument('--norm_spacing', type=int, default=0, help='number of input channels')
-    parser.add_argument('--standard_space', type=list, default=[0.8, 0.8, 0.8], help='number of input channels')
+    parser.add_argument('--norm_orientation', type=int, default=1, help='Reorient images to RPI before inference')
+    parser.add_argument('--norm_spacing', type=int, default=0, help='Resample inputs to a standard spacing before inference')
+    parser.add_argument('--standard_space', type=list, default=[0.8, 0.8, 0.8], help='Target spacing when --norm_spacing=1')
     parser.add_argument('--model_path', type=str,
                         default='/public_bme/data/sMRI_Process_Tool/BrainParc.pth.gz',
                         help='Pretrained model path')
     parser.add_argument('--device', type=str, default='cuda', help='specify device type: cuda or cpu?')
     parser.add_argument('--crop_size', type=tuple, default=(128, 128, 128), help='patch size')
-    parser.add_argument('--overlap_ratio', type=float, default=0.5, help='Overlap ratio to extract '
-                                                                          'patches for single image inference')
+    parser.add_argument('--overlap_ratio', type=float, default=0.5,
+                        help='Overlap ratio to extract patches for single image inference')
+    parser.add_argument('--source_folder', type=str,
+                        default='/public_bme2/bme-wangqian2/wangxy/T1Img',
+                        help='Directory containing subject folders with Step00/Step01 outputs')
+    parser.add_argument('--target_folder', type=str, default=None,
+                        help='Directory where tissue/dk outputs will be written. Defaults to source folder')
+    parser.add_argument('--intensity_filename', type=str, default='brain.nii.gz',
+                        help='Input intensity image filename inside each subject folder')
+    parser.add_argument('--edge_filename', type=str, default='brain_sober.nii.gz',
+                        help='Edge-enhanced image filename inside each subject folder')
+    parser.add_argument('--num_workers', type=int, default=3,
+                        help='Number of parallel worker processes to launch')
 
     args = parser.parse_args()
 
-    source = '/home_data/home/lianzf2024/test'
-    target = '/home_data/home/lianzf2024/test'
+    source = args.source_folder
+    target = args.target_folder if args.target_folder is not None else args.source_folder
 
-    file_list = os.listdir(source)
-    file_list.sort()
-    # file_list = [f for f in file_list if os.path.exists(os.path.join(source, f, 'brain.nii.gz'))]
-    # file_list = [f for f in file_list if not os.path.exists(os.path.join(source, f, 'dk-struct.nii.gz'))]
+    os.makedirs(target, exist_ok=True)
+
+    subjects = _gather_subjects(source, [args.intensity_filename, args.edge_filename])
+
+    if len(subjects) == 0:
+        print('No subjects with required inputs found. Nothing to process.')
+        exit(0)
 
     model = _model_init(args, args.model_path)
 
-    # pool_num = 3
-    # pool = Pool(pool_num)
-    # pbar = tqdm(total=len(file_list))
-    # pbar.set_description('AutoBET: Automatic Brain Extraction Tool')
-    # call_fun = lambda *args: update(pbar, *args)
-    #
-    # for item in file_list:
-    #     kwargs = {
-    #         'args':args,
-    #         'model':model,
-    #         'source': source,
-    #         'target': target,
-    #         'item': item,
-    #     }
-    #     pool.apply_async(_get_pred_parallel, args=(), kwds=kwargs, callback=call_fun, error_callback=error_back)
-    #
-    # pool.close()
-    # pool.join()
+    pool = Pool(processes=args.num_workers)
+    pbar = tqdm(total=len(subjects))
+    pbar.set_description('Brain parcellation inference')
+    call_fun = lambda *call_args: update(pbar, *call_args)
 
+    for item in subjects:
+        kwargs = {
+            'args': args,
+            'model': model,
+            'source': source,
+            'target': target,
+            'item': item,
+        }
+        pool.apply_async(_get_pred_parallel, args=(), kwds=kwargs, callback=call_fun, error_callback=error_back)
 
-    for item in tqdm(file_list):
-        _get_pred_parallel(args, model, source, target, item)
+    pool.close()
+    pool.join()

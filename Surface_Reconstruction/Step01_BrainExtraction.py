@@ -1178,6 +1178,48 @@ def _ants_img_info(img_path):
     return img.origin, img.spacing, img.direction, img.numpy()
 
 
+def _resolve_input_image(source_root, subject_id, args):
+    subject_dir = os.path.join(source_root, subject_id)
+    if not os.path.isdir(subject_dir):
+        raise FileNotFoundError(f'Subject directory not found: {subject_dir}')
+
+    preferred_name = getattr(args, 'input_filename', None)
+    if preferred_name:
+        preferred_path = os.path.join(subject_dir, preferred_name)
+        if os.path.exists(preferred_path):
+            return preferred_path
+        if not getattr(args, 'auto_detect_input', True):
+            raise FileNotFoundError(
+                f"Preferred input '{preferred_name}' not found in {subject_dir} and auto detection disabled.")
+
+    if not getattr(args, 'auto_detect_input', True):
+        raise FileNotFoundError(
+            f"Input image '{preferred_name}' not found in {subject_dir}.")
+
+    suffixes = [s.lower() for s in getattr(args, 'fallback_suffixes', ['.nii', '.nii.gz'])]
+    exclude_keywords = [k.lower() for k in getattr(args, 'exclude_keywords', [])]
+
+    candidates = []
+    for entry in os.listdir(subject_dir):
+        lower_entry = entry.lower()
+        if not any(lower_entry.endswith(suffix) for suffix in suffixes):
+            continue
+        if any(keyword in lower_entry for keyword in exclude_keywords):
+            continue
+        candidates.append(entry)
+
+    if not candidates:
+        available = [entry for entry in os.listdir(subject_dir) if entry.lower().endswith(tuple(suffixes))]
+        raise FileNotFoundError(
+            f"No suitable input image found in {subject_dir}. Available candidates: {available}")
+
+    candidates.sort()
+    selected = candidates[0]
+    selected_path = os.path.join(subject_dir, selected)
+    print(f"[AutoDetect] Using '{selected}' for subject '{subject_id}'.")
+    return selected_path
+
+
 def _seg_to_label(seg):
     '''
     TODO: Labeling each single annotation in one image (single label to multiple label)
@@ -1355,37 +1397,42 @@ def _inference(args, model, img_path):
 
 def get_pred(args, model, source, target, item):
     target_folder = os.path.join(target, item)
-    if not os.path.exists(target_folder):
-        os.mkdir(target_folder)
+    os.makedirs(target_folder, exist_ok=True)
 
-    persudo_brain_path = os.path.join(source, item, 'T1.nii.gz')
-    persudo_brain_tmp_path = os.path.join(source, item, 'T1_tmp.nii.gz')
-    persudo_brain_rpi_path = os.path.join(source, item, 'T1_rpi.nii.gz')
+    input_img_path = _resolve_input_image(source, item, args)
+    image_original = ants.image_read(input_img_path)
 
-    image_original = ants.image_read(persudo_brain_path)
+    output_basename = getattr(args, 'output_basename', 'T1')
+    persudo_brain_path = os.path.join(target_folder, f'{output_basename}.nii.gz')
+    ants.image_write(image_original, persudo_brain_path)
+
+    persudo_brain_tmp_path = os.path.join(target_folder, f'{output_basename}_tmp.nii.gz')
+    persudo_brain_rpi_path = os.path.join(target_folder, f'{output_basename}_rpi.nii.gz')
+
+    inference_input_path = persudo_brain_path
     if args.norm_orientation == 1:
         img = ants.reorient_image2(image_original, 'RPI')
         ants.image_write(img, persudo_brain_rpi_path)
-    else:
-        persudo_brain_rpi_path = os.path.join(source, item, 'T1.nii.gz')
+        inference_input_path = persudo_brain_rpi_path
 
-    origin, spacing, direction, img_rpi = _ants_img_info(persudo_brain_rpi_path)
+    origin, spacing, direction, img_rpi = _ants_img_info(inference_input_path)
     shape = img_rpi.shape
 
     if args.norm_spacing == 1:
-        resampled_img = _resample_image(persudo_brain_rpi_path, new_spacing=args.standard_spacing)
+        resampled_img = _resample_image(inference_input_path, new_spacing=args.standard_spacing)
         sitk.WriteImage(resampled_img, persudo_brain_tmp_path)
 
         pred = _inference(args, model, persudo_brain_tmp_path)
 
         pred = pred.unsqueeze(0)
         pred = nn.functional.interpolate(pred, size=(shape[0], shape[1], shape[2]), mode='trilinear',
-                                                antialias=False)
+                                         antialias=False)
         pred = pred.squeeze(0)
-        os.system('rm {}'.format(persudo_brain_tmp_path))
+        if os.path.exists(persudo_brain_tmp_path):
+            os.remove(persudo_brain_tmp_path)
 
     else:
-        pred = _inference(args, model, persudo_brain_rpi_path)
+        pred = _inference(args, model, inference_input_path)
 
     pred = pred.numpy().argmax(0)
     pred = _select_top_k_region(pred, 1)
@@ -1395,20 +1442,21 @@ def get_pred(args, model, source, target, item):
 
     if args.norm_orientation == 1:
         ants_img_pred = ants.reorient_image2(ants_img_pred, image_original.orientation)
-        os.system('rm {}'.format(persudo_brain_rpi_path))
+        if os.path.exists(persudo_brain_rpi_path):
+            os.remove(persudo_brain_rpi_path)
 
-    return ants_img_pred
+    return ants_img_pred, image_original, persudo_brain_path
 
 
 def get_pred_parallel(args, model, source, target, item):
-    pred = get_pred(args, model, source, target, item)
-    target_seg_path = os.path.join(target, item, 'skull-strip.nii.gz')
+    pred, image_original, persudo_brain_path = get_pred(args, model, source, target, item)
+    target_folder = os.path.join(target, item)
+    target_seg_path = os.path.join(target_folder, 'skull-strip.nii.gz')
     ants.image_write(pred, target_seg_path)
-    source_img_path = os.path.join(source, item, 'T1.nii.gz')
-    origin, spacing, direction, img = _ants_img_info(source_img_path)
-    origin, spacing, direction, seg = _ants_img_info(target_seg_path)
-    brain = ants.from_numpy(img * seg, origin, spacing, direction)
-    ants.image_write(brain, os.path.join(target, item, 'brain.nii.gz'))
+
+    brain_array = image_original.numpy() * pred.numpy()
+    brain = ants.from_numpy(brain_array, image_original.origin, image_original.spacing, image_original.direction)
+    ants.image_write(brain, os.path.join(target_folder, 'brain.nii.gz'))
 
 
 def update(pbar, result):
@@ -1439,13 +1487,31 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda', help='patch size')
     parser.add_argument('--overlap_ratio', type=float, default=0.6, help='Overlap ratio to extract '
                                                                           'patches for single image inference')
+    parser.add_argument('--source_folder', type=str,
+                        default='/public_bme2/bme-wangqian2/wangxy/T1Img',
+                        help='Root directory containing subject folders with raw T1 images')
+    parser.add_argument('--target_folder', type=str, default=None,
+                        help='Output directory for generated skull-strip and brain volumes. Defaults to source folder')
+    parser.add_argument('--input_filename', type=str, default='T1.nii.gz',
+                        help='Preferred input filename inside each subject folder')
+    parser.add_argument('--output_basename', type=str, default='T1',
+                        help='Basename used when writing intensity copies to the target folder')
+    parser.add_argument('--fallback_suffixes', nargs='+', default=['.nii', '.nii.gz'],
+                        help='File suffixes considered when auto-detecting input images')
+    parser.add_argument('--exclude_keywords', nargs='+', default=['crop'],
+                        help='Lowercase keywords that should be excluded when auto-detecting input images')
+    parser.add_argument('--disable_auto_detect', action='store_true',
+                        help='Disable automatic fallback search when the preferred input is missing')
 
     args = parser.parse_args()
+    args.auto_detect_input = not args.disable_auto_detect
 
-    source = '/home_data/home/lianzf2024/test'
-    target = '/home_data/home/lianzf2024/test'
+    source = args.source_folder
+    target = args.target_folder if args.target_folder is not None else source
 
-    file_list = os.listdir(source)
+    os.makedirs(target, exist_ok=True)
+
+    file_list = [f for f in os.listdir(source) if os.path.isdir(os.path.join(source, f))]
     file_list.sort()
 
     model = _model_init(args, args.model_path)
