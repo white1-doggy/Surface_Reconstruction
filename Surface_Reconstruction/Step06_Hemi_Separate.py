@@ -1190,39 +1190,50 @@ def _inference(args, model, img_path):
     return pred
 
 
+def _strip_nii_suffix(filename: str) -> str:
+    if filename.endswith('.nii.gz'):
+        return filename[:-7]
+    if filename.endswith('.nii'):
+        return filename[:-4]
+    return os.path.splitext(filename)[0]
+
+
 def get_pred(args, model, source, target, item):
     target_folder = os.path.join(target, item)
-    if not os.path.exists(target_folder):
-        os.mkdir(target_folder)
+    os.makedirs(target_folder, exist_ok=True)
 
-    persudo_brain_path = os.path.join(source, item, 'tissue.nii.gz')
-    persudo_brain_tmp_path = os.path.join(source, item, 'tissue_tmp.nii.gz')
-    persudo_brain_rpi_path = os.path.join(source, item, 'tissue_rpi.nii.gz')
+    source_folder = os.path.join(source, item)
 
-    image_original = ants.image_read(persudo_brain_path)
+    tissue_path = os.path.join(source_folder, args.tissue_filename)
+    tissue_tmp_path = os.path.join(target_folder, f"{_strip_nii_suffix(args.tissue_filename)}_tmp.nii.gz")
+    tissue_rpi_path = os.path.join(target_folder, f"{_strip_nii_suffix(args.tissue_filename)}_tmp_RPI.nii.gz")
+
+    image_original = ants.image_read(tissue_path)
     if args.norm_orientation == 1:
         img = ants.reorient_image2(image_original, 'RPI')
-        ants.image_write(img, persudo_brain_rpi_path)
+        ants.image_write(img, tissue_rpi_path)
+        inference_path = tissue_rpi_path
     else:
-        persudo_brain_rpi_path = os.path.join(source, item, 'tissue.nii.gz')
+        inference_path = tissue_path
 
-    origin, spacing, direction, img_rpi = _ants_img_info(persudo_brain_rpi_path)
+    origin, spacing, direction, img_rpi = _ants_img_info(inference_path)
     shape = img_rpi.shape
 
     if args.norm_spacing == 1:
-        resampled_img = _resample_image(persudo_brain_rpi_path, new_spacing=args.standard_spacing)
-        sitk.WriteImage(resampled_img, persudo_brain_tmp_path)
+        resampled_img = _resample_image(inference_path, new_spacing=args.standard_spacing)
+        sitk.WriteImage(resampled_img, tissue_tmp_path)
 
-        pred = _inference(args, model, persudo_brain_tmp_path)
+        pred = _inference(args, model, tissue_tmp_path)
 
         pred = pred.unsqueeze(0)
         pred = nn.functional.interpolate(pred, size=(shape[0], shape[1], shape[2]), mode='trilinear',
-                                                antialias=False)
+                                         antialias=False)
         pred = pred.squeeze(0)
-        os.system('rm {}'.format(persudo_brain_tmp_path))
+        if os.path.exists(tissue_tmp_path):
+            os.remove(tissue_tmp_path)
 
     else:
-        pred = _inference(args, model, persudo_brain_rpi_path)
+        pred = _inference(args, model, inference_path)
 
     pred = pred.numpy().argmax(0)
     pred = pred.astype(np.float32)
@@ -1231,14 +1242,17 @@ def get_pred(args, model, source, target, item):
 
     if args.norm_orientation == 1:
         ants_img_pred = ants.reorient_image2(ants_img_pred, image_original.orientation)
-        os.system('rm {}'.format(persudo_brain_rpi_path))
+        if os.path.exists(tissue_rpi_path):
+            os.remove(tissue_rpi_path)
 
     return ants_img_pred
 
 
 def get_pred_parallel(args, model, source, target, item):
     pred = get_pred(args, model, source, target, item)
-    target_seg_path = os.path.join(target, item, 'hemi.nii.gz')
+    target_folder = os.path.join(target, item)
+    os.makedirs(target_folder, exist_ok=True)
+    target_seg_path = os.path.join(target_folder, args.hemi_filename)
     ants.image_write(pred, target_seg_path)
 
 
@@ -1250,43 +1264,79 @@ def error_back(err):
     print(err)
 
 
+def _gather_subjects(source, tissue_filename):
+    subjects = []
+    missing_inputs = []
+    for name in sorted(os.listdir(source)):
+        subj_dir = os.path.join(source, name)
+        if not os.path.isdir(subj_dir):
+            continue
+        expected = os.path.join(subj_dir, tissue_filename)
+        if os.path.exists(expected):
+            subjects.append(name)
+        else:
+            missing_inputs.append(name)
+
+    if missing_inputs:
+        print('Skipping subjects without required inputs:')
+        for name in missing_inputs:
+            print(f'  - {name}: missing {tissue_filename}')
+
+    return subjects
+
+
 if __name__ == '__main__':
     import multiprocessing
     from multiprocessing import Pool
     from tqdm import tqdm
 
-    multiprocessing.set_start_method('spawn')
-    parser = argparse.ArgumentParser(description='Infant segmentation Experiment settings')
+    multiprocessing.set_start_method('spawn', force=True)
+    parser = argparse.ArgumentParser(description='Hemisphere mask segmentation from tissue labels')
     parser.add_argument('--num_classes', type=int, default=1, help='number of output channels')
     parser.add_argument('--num_modalities', type=int, default=1, help='number of input channels')
-    parser.add_argument('--norm_orientation', type=int, default=1, help='number of input channels')
-    parser.add_argument('--norm_spacing', type=int, default=0, help='number of input channels')
-    parser.add_argument('--standard_spacing', type=list, default=[1, 1, 1], help='number of input channels')
+    parser.add_argument('--norm_orientation', type=int, default=1, help='Reorient images to RPI before inference')
+    parser.add_argument('--norm_spacing', type=int, default=0, help='Resample inputs to standard spacing before inference')
+    parser.add_argument('--standard_spacing', type=list, default=[1, 1, 1], help='Target spacing when --norm_spacing=1')
     parser.add_argument('--model_path', type=str,
                         default='/public_bme2/bme-dgshen/ZifengLian/BrainSurf/Hemi_Separate/TissueHemi.pth.gz',
                         help='Pretrained model path')
     parser.add_argument('--crop_size', type=tuple, default=(128, 128, 128), help='patch size')
-    parser.add_argument('--device', type=str, default='cuda', help='patch size')
-    parser.add_argument('--overlap_ratio', type=float, default=0.5, help='Overlap ratio to extract '
-                                                                          'patches for single image inference')
+    parser.add_argument('--device', type=str, default='cuda', help='Device to run inference on')
+    parser.add_argument('--overlap_ratio', type=float, default=0.5,
+                        help='Overlap ratio to extract patches for single image inference')
+    parser.add_argument('--source_folder', type=str,
+                        default='/public_bme2/bme-wangqian2/wangxy/T1Img',
+                        help='Directory containing subject folders with tissue volumes')
+    parser.add_argument('--target_folder', type=str, default=None,
+                        help='Directory where hemisphere masks will be written. Defaults to source folder')
+    parser.add_argument('--tissue_filename', type=str, default='tissue.nii.gz',
+                        help='Filename of the input tissue segmentation volume')
+    parser.add_argument('--hemi_filename', type=str, default='hemi.nii.gz',
+                        help='Filename used when writing the hemisphere mask')
+    parser.add_argument('--num_workers', type=int, default=1,
+                        help='Number of parallel worker processes to launch')
 
     args = parser.parse_args()
 
     model = _model_init(args, args.model_path)
 
-    source = '/home_data/home/lianzf2024/test'
-    target = '/home_data/home/lianzf2024/test'
+    source = args.source_folder
+    target = args.target_folder if args.target_folder is not None else args.source_folder
 
-    file_list = os.listdir(source)
-    file_list.sort()
+    os.makedirs(target, exist_ok=True)
 
-    pool_num = 1
-    pool = Pool(pool_num)
-    pbar = tqdm(total=len(file_list))
-    pbar.set_description('Hemi Sphere Segmentation')
-    call_fun = lambda *args: update(pbar, *args)
+    subjects = _gather_subjects(source, args.tissue_filename)
 
-    for item in file_list:
+    if len(subjects) == 0:
+        print('No subjects with required inputs found. Nothing to process.')
+        exit(0)
+
+    pool = Pool(processes=args.num_workers)
+    pbar = tqdm(total=len(subjects))
+    pbar.set_description('Hemisphere segmentation')
+    call_fun = lambda *call_args: update(pbar, *call_args)
+
+    for item in subjects:
         kwargs = {
             'args': args,
             'model': model,

@@ -1,4 +1,5 @@
 import os
+import argparse
 import ants
 import scipy
 import numpy as np
@@ -71,9 +72,11 @@ def _ants_img_info(img_path):
     return img.origin, img.spacing, img.direction, img.numpy()
 
 
-def _dk_refine(source, target, item):
-    dk_path = os.path.join(source, item, 'dk-struct.nii.gz')
-    dk_refined_path = os.path.join(target, item, 'dk-struct.nii.gz')
+def _dk_refine(source, target, item, dk_filename):
+    dk_path = os.path.join(source, item, dk_filename)
+    target_folder = os.path.join(target, item)
+    os.makedirs(target_folder, exist_ok=True)
+    dk_refined_path = os.path.join(target_folder, dk_filename)
 
     origin, spacing, direction, dk = _ants_img_info(dk_path)
     for idx in label_index:
@@ -114,29 +117,68 @@ def error_back(err):
     print(err)
 
 
+def _gather_subjects(source, required_file):
+    subjects = []
+    missing_inputs = []
+    for name in sorted(os.listdir(source)):
+        subj_dir = os.path.join(source, name)
+        if not os.path.isdir(subj_dir):
+            continue
+        expected = os.path.join(subj_dir, required_file)
+        if os.path.exists(expected):
+            subjects.append(name)
+        else:
+            missing_inputs.append(name)
+
+    if missing_inputs:
+        print('Skipping subjects without required inputs:')
+        for name in missing_inputs:
+            print(f'  - {name}: missing {required_file}')
+
+    return subjects
+
+
 if __name__ == '__main__':
     from multiprocessing import Pool
     from tqdm import tqdm
     from IPython import embed
 
-    source = '/home_data/home/lianzf2024/test'
-    target = '/home_data/home/lianzf2024/test'
+    parser = argparse.ArgumentParser(description='Refine DK structure labels by removing noisy components')
+    parser.add_argument('--source_folder', type=str,
+                        default='/public_bme2/bme-wangqian2/wangxy/T1Img',
+                        help='Directory containing subject folders with DK segmentations')
+    parser.add_argument('--target_folder', type=str, default=None,
+                        help='Directory where refined DK segmentations will be written. Defaults to source folder')
+    parser.add_argument('--dk_filename', type=str, default='dk-struct.nii.gz',
+                        help='Filename of the DK segmentation volume to refine')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of parallel worker processes to launch')
 
-    file_list = os.listdir(source)
-    file_list.sort()
+    args = parser.parse_args()
 
-    pool_num = 8
-    pool = Pool(pool_num)
-    pbar = tqdm(total=len(file_list))
-    pbar.set_description('Data Reorient')
-    call_fun = lambda *args: update(pbar, *args)
+    source = args.source_folder
+    target = args.target_folder if args.target_folder is not None else args.source_folder
 
-    for item in file_list:
+    os.makedirs(target, exist_ok=True)
+
+    subjects = _gather_subjects(source, args.dk_filename)
+
+    if len(subjects) == 0:
+        print('No subjects with required inputs found. Nothing to process.')
+        exit(0)
+
+    pool = Pool(processes=args.num_workers)
+    pbar = tqdm(total=len(subjects))
+    pbar.set_description('DK refinement')
+    call_fun = lambda *call_args: update(pbar, *call_args)
+
+    for item in subjects:
         kwargs = {
-            'source':source,
-            'target':target,
-            'item':item
-            }
+            'source': source,
+            'target': target,
+            'item': item,
+            'dk_filename': args.dk_filename,
+        }
         pool.apply_async(_dk_refine, args=(), kwds=kwargs, callback=call_fun, error_callback=error_back)
 
     pool.close()
